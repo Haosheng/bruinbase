@@ -89,6 +89,18 @@ PageId BTLeafNode::getNextNodePtr()
 RC BTLeafNode::setNextNodePtr(PageId pid)
 { return 0; }
 
+/********************************* Non Leaf Node ************************************/
+BTNonLeafNode::BTNonLeafNode() {
+	key_count = 0;
+	bzero(buffer, PageFile::PAGE_SIZE);
+}
+
+struct BTNonLeafNode::non_leaf_entry {
+	non_leaf_entry(int Key, PageId Pid):key(Key),pid(Pid){}
+	int key;
+	PageId pid;
+};
+
 /*
  * Read the content of the node from the page pid in the PageFile pf.
  * @param pid[IN] the PageId to read
@@ -96,7 +108,9 @@ RC BTLeafNode::setNextNodePtr(PageId pid)
  * @return 0 if successful. Return an error code if there is an error.
  */
 RC BTNonLeafNode::read(PageId pid, const PageFile& pf)
-{ return 0; }
+{ 
+	return pf.read(pid, buffer); 
+}
     
 /*
  * Write the content of the node to the page pid in the PageFile pf.
@@ -105,14 +119,26 @@ RC BTNonLeafNode::read(PageId pid, const PageFile& pf)
  * @return 0 if successful. Return an error code if there is an error.
  */
 RC BTNonLeafNode::write(PageId pid, PageFile& pf)
-{ return 0; }
+{ 
+	return pf.write(pid, buffer); 
+}
 
 /*
  * Return the number of keys stored in the node.
  * @return the number of keys in the node
  */
 int BTNonLeafNode::getKeyCount()
-{ return 0; }
+{ 
+	int count = 0;
+	int max_num_entry = (PageFile::PAGE_SIZE - sizeof(PageId)) / (sizeof(non_leaf_entry));
+	non_leaf_entry* entry_ptr = (non_leaf_entry*) buffer;
+	while(count < max_num_entry){
+		if(entry_ptr->key == 0) break;
+		count++;
+		entry_ptr++;
+	}
+	return count;
+}
 
 
 /*
@@ -122,7 +148,35 @@ int BTNonLeafNode::getKeyCount()
  * @return 0 if successful. Return an error code if the node is full.
  */
 RC BTNonLeafNode::insert(int key, PageId pid)
-{ return 0; }
+{ 
+	int cur_entry_count = getKeyCount();
+	int max_num_entry = (PageFile::PAGE_SIZE - sizeof(PageId)) / (sizeof(non_leaf_entry));
+	if(cur_entry_count >= max_num_entry) return RC_NODE_FULL;
+	//buffer_ptr points to the head of first non_leaf_entry
+	char* buffer_ptr = buffer + PageFile::PAGE_SIZE - max_num_entry*sizeof(non_leaf_entry);
+	int i;
+	for(i = 0; i < max_num_entry; i++){
+		int* cur_key_ptr;
+		cur_key_ptr = (int*)buffer_ptr;
+		if(*cur_key_ptr == 0 || key <= *cur_key_ptr) break;
+        buffer_ptr = (char*)buffer_ptr;
+        buffer_ptr+= sizeof(non_leaf_entry);
+	}
+	//new_entry is the entry to insert
+	non_leaf_entry* new_entry = new non_leaf_entry(key, pid);
+	//shift_ptr points to the last entry in the buffer
+	non_leaf_entry* shift_ptr = (non_leaf_entry*)buffer + cur_entry_count;
+	char* temp_buffer = new char[PageFile::PAGE_SIZE];
+	//shift [buffer_ptr, shift_ptr+8] to sizeof(non_leaf_entry) right
+	size_t to_shift_size = (char*)shift_ptr - buffer_ptr + 8;
+	memcpy(temp_buffer+sizeof(non_leaf_entry), buffer_ptr, to_shift_size);
+	memcpy(temp_buffer, new_entry, sizeof(non_leaf_entry));
+	memcpy(buffer_ptr, temp_buffer, to_shift_size+sizeof(non_leaf_entry));
+	key_count++;
+	delete[] temp_buffer;
+	delete new_entry;
+	return 0; 
+}
 
 /*
  * Insert the (key, pid) pair to the node
@@ -135,7 +189,59 @@ RC BTNonLeafNode::insert(int key, PageId pid)
  * @return 0 if successful. Return an error code if there is an error.
  */
 RC BTNonLeafNode::insertAndSplit(int key, PageId pid, BTNonLeafNode& sibling, int& midKey)
-{ return 0; }
+{ 
+	int cur_entry_count = getKeyCount();
+	int max_num_entry = (PageFile::PAGE_SIZE - sizeof(PageId)) / (sizeof(non_leaf_entry));
+
+	if(cur_entry_count < max_num_entry) return RC_INVALID_FILE_FORMAT;
+
+	if(sibling.getKeyCount()!=0) return RC_INVALID_ATTRIBUTE;
+
+	int half_count = (cur_entry_count+1)/2;
+
+	int half_index = half_count*sizeof(non_leaf_entry)+8;
+
+	int key1 = *((int*)(buffer + half_index - 8));
+	int key2 = *((int*)(buffer + half_index));
+
+	if(key < key1) {
+		memcpy(sibling.buffer+8, buffer + half_index, PageFile::PAGE_SIZE - half_index);
+		sibling.key_count = cur_entry_count - half_count;
+
+		midKey = *((int*)(buffer + half_index - 8));
+		memcpy(sibling.buffer, buffer+half_index-4, sizeof(PageId));
+
+		fill(buffer+half_index-8, buffer + PageFile::PAGE_SIZE, 0);
+		key_count = half_count - 1;
+
+		insert(key, pid);
+	}
+	else if(key > key2){
+		memcpy(sibling.buffer+8, buffer + half_index + 8, PageFile::PAGE_SIZE - half_index - 8);
+		sibling.key_count = cur_entry_count - half_count -1;
+
+		midKey = *((int*)(buffer + half_index));
+		memcpy(sibling.buffer, buffer+half_index+4, sizeof(PageId));
+
+		fill(buffer + half_index, buffer + PageFile::PAGE_SIZE, 0);
+		key_count = half_count;
+
+		sibling.insert(key, pid);
+	}
+	else{
+		memcpy(sibling.buffer + 8, buffer + half_index, PageFile::PAGE_SIZE - half_index);
+		sibling.key_count = cur_entry_count - half_count;
+
+		fill(buffer+half_index, buffer+PageFile::PAGE_SIZE, 0);
+		key_count = half_count;
+
+		midKey = key;
+
+		memcpy(sibling.buffer, &pid, sizeof(PageId));
+
+	}
+	return 0; 
+}
 
 /*
  * Given the searchKey, find the child-node pointer to follow and
@@ -145,7 +251,28 @@ RC BTNonLeafNode::insertAndSplit(int key, PageId pid, BTNonLeafNode& sibling, in
  * @return 0 if successful. Return an error code if there is an error.
  */
 RC BTNonLeafNode::locateChildPtr(int searchKey, PageId& pid)
-{ return 0; }
+{ 
+	int cur_entry_count = getKeyCount();
+    int max_num_entry = (PageFile::PAGE_SIZE - sizeof(PageId)) / (sizeof(non_leaf_entry));
+	char* buffer_ptr = buffer + PageFile::PAGE_SIZE - max_num_entry*sizeof(non_leaf_entry);
+	int i;
+	for(i=8; i < (cur_entry_count+1)*sizeof(non_leaf_entry); i+=sizeof(non_leaf_entry)){
+		int* cur_key_ptr;
+		cur_key_ptr = (int*)buffer_ptr;
+		if(i==8 && *cur_key_ptr > searchKey){
+			pid = *((PageId*)buffer);
+			return 0;
+		}
+		else if(*cur_key_ptr > searchKey){
+			pid = *((PageId*)buffer_ptr-1);
+			return 0;
+		}
+        buffer_ptr = (char*)buffer_ptr;
+        buffer_ptr+= sizeof(non_leaf_entry);
+	}
+	pid = *((PageId*)buffer_ptr-1);
+	return 0; 
+}
 
 /*
  * Initialize the root node with (pid1, key, pid2).
@@ -155,4 +282,12 @@ RC BTNonLeafNode::locateChildPtr(int searchKey, PageId& pid)
  * @return 0 if successful. Return an error code if there is an error.
  */
 RC BTNonLeafNode::initializeRoot(PageId pid1, int key, PageId pid2)
-{ return 0; }
+{
+	bzero(buffer, PageFile::PAGE_SIZE);
+
+    char* tmp = buffer;
+    memcpy(tmp, &pid1, sizeof(PageId));
+    
+    RC r = insert(key, pid2);
+	return r;
+ }
